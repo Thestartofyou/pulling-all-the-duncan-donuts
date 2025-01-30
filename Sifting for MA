@@ -1,0 +1,153 @@
+import json
+import logging
+import os
+from collections import namedtuple
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Configuration Section
+INPUT_FILE = 'dunkin_donuts.json'  # Input JSON file
+OUTPUT_FILE_JSON = 'dunkin_donuts_filtered.json'  # Output JSON file for filtered locations
+OUTPUT_FILE_CSV = 'dunkin_donuts_filtered.csv'  # Optional: Output CSV file for filtered locations
+TARGET_STATE = 'MA'  # State to filter by (Massachusetts)
+
+def load_json(file_path):
+    """
+    Load JSON data from a file.
+
+    Args:
+        file_path (str): Path to the JSON file.
+
+    Returns:
+        dict or list: Parsed JSON data.
+    """
+    try:
+        with open(file_path, 'r') as file:
+            logging.info(f"Loading data from {file_path}...")
+            return json.load(file)
+    except FileNotFoundError:
+        logging.error(f"File not found: {file_path}")
+        raise
+    except json.JSONDecodeError:
+        logging.error(f"Invalid JSON format in file: {file_path}")
+        raise
+
+def save_json(data, file_path):
+    """
+    Save data to a JSON file.
+
+    Args:
+        data (dict or list): Data to save.
+        file_path (str): Path to the output JSON file.
+    """
+    try:
+        with open(file_path, 'w') as file:
+            logging.info(f"Saving data to {file_path}...")
+            json.dump(data, file, indent=4)
+    except Exception as e:
+        logging.error(f"Failed to save JSON file: {e}")
+        raise
+
+def save_csv(data, file_path):
+    """
+    Save data to a CSV file.
+
+    Args:
+        data (list): List of dictionaries to save.
+        file_path (str): Path to the output CSV file.
+    """
+    try:
+        import csv
+        if not data:
+            logging.warning("No data to save as CSV.")
+            return
+
+        keys = data[0].keys()  # Get column headers from the first dictionary
+        with open(file_path, 'w', newline='', encoding='utf-8') as file:
+            logging.info(f"Saving data to {file_path}...")
+            writer = csv.DictWriter(file, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(data)
+    except Exception as e:
+        logging.error(f"Failed to save CSV file: {e}")
+        raise
+
+def extract_state(location):
+    """
+    Extract the state abbreviation from the address field.
+
+    Args:
+        location (dict): A dictionary representing a location.
+
+    Returns:
+        str or None: The extracted state abbreviation, or None if not found.
+    """
+    address = location.get('address')
+    if not address:
+        logging.warning(f"Missing or invalid 'address' field in location: {location}")
+        return None
+
+    try:
+        # Split the address by commas and extract the last token (state abbreviation)
+        tokens = address.split(',')
+        state = tokens[-1].strip().split()[0]  # Extract the state abbreviation (e.g., "MA")
+        return state
+    except Exception as e:
+        logging.warning(f"Failed to extract state from address: {address}. Error: {e}")
+        return None
+
+def filter_locations_by_state(data, state):
+    """
+    Filter locations by a specific state.
+
+    Args:
+        data (list): List of location dictionaries.
+        state (str): State abbreviation to filter by.
+
+    Returns:
+        list: Filtered list of locations.
+    """
+    logging.info(f"Filtering locations by state: {state}")
+    filtered_locations = []
+
+    for location in data:
+        record_state = extract_state(location)
+        if record_state == state:
+            filtered_locations.append(location)
+
+    logging.info(f"Found {len(filtered_locations)} locations in {state}.")
+    return filtered_locations
+
+def main():
+    """
+    Main function to load, filter, and save Dunkin' Donuts locations.
+    """
+    try:
+        # Step 1: Load the JSON data
+        all_data = load_json(INPUT_FILE)
+
+        # Step 2: Filter locations by state
+        filtered_data = filter_locations_by_state(all_data, TARGET_STATE)
+
+        # Step 3: Print the filtered locations
+        if filtered_data:
+            print("\nDunkin' Donuts Locations in Massachusetts:")
+            for location in filtered_data:
+                print(json.dumps(location, indent=4))
+        else:
+            logging.warning(f"No locations found in {TARGET_STATE}.")
+
+        # Step 4: Save the filtered data to a JSON file
+        save_json(filtered_data, OUTPUT_FILE_JSON)
+
+        # Optional: Save the filtered data to a CSV file
+        save_csv(filtered_data, OUTPUT_FILE_CSV)
+
+        logging.info("Process completed successfully.")
+
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    main()
