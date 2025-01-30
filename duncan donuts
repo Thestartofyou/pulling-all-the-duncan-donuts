@@ -1,0 +1,308 @@
+import json
+import logging
+import time
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Set, Tuple
+import argparse
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+from tqdm import tqdm  # Progress bar library
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s: %(message)s")
+
+# Overpass API endpoint
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+# A custom User-Agent helps Overpass API operators contact you in case of issues.
+HEADERS = {
+    "User-Agent": "DunkinDonutsFetcher/2.0 (contact: your_email@example.com)"
+}
+
+# Rate limiting (in seconds)
+REQUEST_DELAY = 2  # Delay between requests to avoid overwhelming the API
+
+def validate_bbox(bbox: str) -> bool:
+    """
+    Validate the bounding box format and values.
+    :param bbox: Bounding box in "min_lat,min_lon,max_lat,max_lon" format.
+    :return: True if valid, False otherwise.
+    """
+    try:
+        min_lat, min_lon, max_lat, max_lon = map(float, bbox.split(","))
+        return (
+            -90 <= min_lat <= 90
+            and -180 <= min_lon <= 180
+            and -90 <= max_lat <= 90
+            and -180 <= max_lon <= 180
+            and min_lat < max_lat
+            and min_lon < max_lon
+        )
+    except ValueError:
+        return False
+
+def build_overpass_query(bbox: Optional[str] = None) -> str:
+    """
+    Build an Overpass QL query string to fetch Dunkin' Donuts locations.
+    :param bbox: Optional bounding box in "min_lat,min_lon,max_lat,max_lon" format.
+    :return: A string containing the Overpass QL query.
+    """
+    # If a bbox is supplied, Overpass uses (lat, lon, lat, lon) ordering.
+    # We'll apply it as a bounding box filter in the query.
+    bbox_filter = f"({bbox})" if bbox else ""
+
+    # We look for elements (node, way, relation) that have either:
+    #   brand="Dunkin" or brand="Dunkin' Donuts"
+    #   name="Dunkin" or name="Dunkin' Donuts"
+    # The parentheses around the node/way/relation queries act like an OR.
+    return f"""
+    [out:json][timeout:180];
+    (
+      node[~"^(brand|name)$"~"Dunkin'? Donuts"]{bbox_filter};
+      node[~"^(brand|name)$"~"Dunkin\\'?"]{bbox_filter};
+      way[~"^(brand|name)$"~"Dunkin'? Donuts"]{bbox_filter};
+      way[~"^(brand|name)$"~"Dunkin\\'?"]{bbox_filter};
+      relation[~"^(brand|name)$"~"Dunkin'? Donuts"]{bbox_filter};
+      relation[~"^(brand|name)$"~"Dunkin\\'?"]{bbox_filter};
+    );
+    out center;
+    """
+
+def create_session_with_retries(
+    total_retries: int = 5,
+    backoff_factor: float = 1.0,
+    status_forcelist: Optional[List[int]] = None,
+) -> requests.Session:
+    """
+    Create a requests Session object that retries failed requests automatically.
+    :param total_retries: Total number of retries for requests.
+    :param backoff_factor: A backoff factor for sleep between retry attempts.
+    :param status_forcelist: HTTP status codes that should trigger a retry.
+    :return: A configured requests Session.
+    """
+    if status_forcelist is None:
+        status_forcelist = [429, 500, 502, 503, 504]
+
+    session = requests.Session()
+    retries = Retry(
+        total=total_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        raise_on_status=False,  # We'll handle status checks ourselves
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def parse_element(element: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Parse an Overpass API element (node, way, relation) into a Dunkin' Donuts location dictionary.
+    :param element: A single element from the Overpass API response.
+    :return: A dictionary with Dunkin' Donuts location details, or None if parsing fails.
+    """
+    elem_type = element.get("type")
+    if elem_type not in ["node", "way", "relation"]:
+        return None
+
+    tags = element.get("tags", {})
+
+    # Attempt to parse address tags if available
+    housenumber = tags.get("addr:housenumber", "")
+    street = tags.get("addr:street", "")
+    city = tags.get("addr:city", "")
+    state = tags.get("addr:state", "")
+    country = tags.get("addr:country", "")
+
+    # Build a nice combined address if possible
+    # This is optional, feel free to adapt as needed
+    address_parts = [part for part in [housenumber, street, city, state, country] if part]
+    address = ", ".join(address_parts) if address_parts else None
+
+    # Basic name fallback
+    name = tags.get("name", "Dunkin' Donuts")
+
+    # Coordinates can be on the element if it's a node or in "center" if it's a way/relation
+    lat = element.get("lat") or element.get("center", {}).get("lat")
+    lon = element.get("lon") or element.get("center", {}).get("lon")
+
+    # Validate coordinates
+    if lat is None or lon is None or not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        logging.warning(f"Invalid coordinates for {name} (id={element.get('id')})")
+        return None
+
+    return {
+        "osm_id": element.get("id"),
+        "osm_type": elem_type,  # node / way / relation
+        "name": name,
+        "address": address,
+        "latitude": lat,
+        "longitude": lon,
+    }
+
+def fetch_dunkin_donuts_locations(bbox: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch Dunkin' Donuts locations from OpenStreetMap via Overpass.
+    :param bbox: Optional bounding box in "min_lat,min_lon,max_lat,max_lon" format.
+    :return: A list of dictionaries, each containing Dunkin' Donuts location info.
+    """
+    query = build_overpass_query(bbox)
+    session = create_session_with_retries()
+
+    logging.info(f"Fetching Dunkin' Donuts locations (bbox: {bbox})")
+    try:
+        response = session.get(OVERPASS_URL, params={"data": query}, headers=HEADERS, timeout=180)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logging.error(f"Request failed for bbox={bbox}: {e}")
+        return []
+
+    try:
+        data = response.json()
+    except json.JSONDecodeError:
+        logging.error(f"Failed to decode JSON response for bbox={bbox}.")
+        return []
+
+    elements = data.get("elements", [])
+    logging.info(f"Received {len(elements)} elements from Overpass for bbox={bbox}.")
+
+    dunkin_locations = []
+    for element in elements:
+        parsed_location = parse_element(element)
+        if parsed_location:
+            dunkin_locations.append(parsed_location)
+
+    return dunkin_locations
+
+def split_bbox(bbox: str, num_splits: int = 2) -> List[str]:
+    """
+    Split a bounding box into smaller sub-boxes.
+    :param bbox: Bounding box in "min_lat,min_lon,max_lat,max_lon" format.
+    :param num_splits: Number of splits along each axis.
+    :return: List of smaller bounding boxes.
+    """
+    if not validate_bbox(bbox):
+        raise ValueError(f"Invalid bounding box: {bbox}. Must be 'min_lat,min_lon,max_lat,max_lon' format.")
+
+    min_lat, min_lon, max_lat, max_lon = map(float, bbox.split(","))
+    lat_step = (max_lat - min_lat) / num_splits
+    lon_step = (max_lon - min_lon) / num_splits
+
+    bboxes = []
+    for i in range(num_splits):
+        for j in range(num_splits):
+            sub_min_lat = min_lat + i * lat_step
+            sub_max_lat = min_lat + (i + 1) * lat_step
+            sub_min_lon = min_lon + j * lon_step
+            sub_max_lon = min_lon + (j + 1) * lon_step
+            bboxes.append(f"{sub_min_lat},{sub_min_lon},{sub_max_lat},{sub_max_lon}")
+
+    return bboxes
+
+def save_to_file(data: List[Dict[str, Any]], output_path: Path) -> None:
+    """
+    Save Dunkin' Donuts location data to a file in JSON format.
+    :param data: List of Dunkin' Donuts location dictionaries.
+    :param output_path: Path to the output file.
+    """
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        logging.info(f"Data saved to {output_path}")
+    except IOError as e:
+        logging.error(f"Failed to save data to {output_path}: {e}")
+
+def main():
+    """Main function to fetch and save Dunkin' Donuts locations."""
+    parser = argparse.ArgumentParser(description="Fetch Dunkin' Donuts locations from OpenStreetMap.")
+    parser.add_argument(
+        "--output", 
+        type=str, 
+        default="dunkin_donuts.json", 
+        help="Output file path (default: dunkin_donuts.json)."
+    )
+    parser.add_argument(
+        "--bbox", 
+        type=str, 
+        default="24.396308,-125.000000,49.384358,-66.934570", 
+        help="Bounding box in 'min_lat,min_lon,max_lat,max_lon' format (default: approximate USA)."
+    )
+    parser.add_argument(
+        "--split", 
+        type=int, 
+        default=4, 
+        help="Number of splits along each axis for the bounding box (default: 4)."
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent threads to use for fetching (default: 1 = sequential)."
+    )
+    args = parser.parse_args()
+
+    output_path = Path(args.output)
+    if output_path.exists():
+        logging.warning(f"Output file {output_path} already exists and will be overwritten.")
+
+    # Validate bounding box
+    if not validate_bbox(args.bbox):
+        logging.error(f"Invalid bounding box: {args.bbox}. Exiting.")
+        return
+
+    # Split bounding box into sub-bboxes
+    bboxes = split_bbox(args.bbox, args.split)
+
+    # Deduplicate locations based on OSM id + type or fallback to (lat, lon).
+    # We'll store them in a dict so we can quickly check for uniqueness.
+    all_locations = {}
+
+    logging.info(f"Processing {len(bboxes)} sub-bounding boxes with {args.workers} worker(s).")
+
+    # Concurrency with ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        # Submit tasks
+        future_to_bbox = {
+            executor.submit(fetch_dunkin_donuts_locations, bbox): bbox
+            for bbox in bboxes
+        }
+
+        # Gather results
+        for future in tqdm(as_completed(future_to_bbox), total=len(bboxes), desc="Fetching data"):
+            bbox_str = future_to_bbox[future]
+            try:
+                results = future.result()
+            except Exception as e:
+                logging.error(f"Failed to fetch data for bbox={bbox_str}: {e}")
+                results = []
+
+            # Add to our global deduplicated set/dict
+            for loc in results:
+                osm_id = loc.get("osm_id")
+                osm_type = loc.get("osm_type")
+
+                # If we have an OSM ID, use (osm_type, osm_id) as a key
+                # Otherwise, fall back to approximate lat-lon key
+                if osm_id is not None:
+                    key = (osm_type, osm_id)
+                else:
+                    key = (round(loc["latitude"], 7), round(loc["longitude"], 7))
+
+                # If not in the dictionary, add it
+                if key not in all_locations:
+                    all_locations[key] = loc
+
+            # Rate-limiting delay after each request
+            time.sleep(REQUEST_DELAY)
+
+    # Convert dict back to a list
+    dunkin_locations = list(all_locations.values())
+    logging.info(f"Found {len(dunkin_locations)} unique Dunkin' Donuts locations in the specified area.")
+
+    # Save results to a file
+    save_to_file(dunkin_locations, output_path)
+
+if __name__ == "__main__":
+    main()
